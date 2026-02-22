@@ -110,23 +110,31 @@ async fn start_violation_bridge(
         config.violation.udp_client_port, vio_tcp_server_port
     );
 
-    // Bind UDP socket on loopback for communication with QUIC client
-    let udp = UdpSocket::bind(format!("{}:{}", config.quic.local_ip, config.violation.udp_client_port)).await?;
+    // Bind UDP socket for communication with QUIC client
+    let udp = UdpSocket::bind(format!("0.0.0.0:{}", config.violation.udp_client_port)).await?;
     let udp = Arc::new(udp);
 
     let udp_send = udp.clone();
     let udp_recv = udp.clone();
+
+    // Track the QUIC client's actual source address dynamically.
+    // Quinn may send from different local IPs via PKTINFO, so we must
+    // send responses back to whatever address it actually used.
+    let quic_client_addr = Arc::new(tokio::sync::Mutex::new(quic_addr));
+    let addr_writer = quic_client_addr.clone();
+    let addr_reader = quic_client_addr.clone();
 
     // Task 1: Sniffed violation responses -> QUIC client (via UDP)
     let vio_to_quic = tokio::spawn(async move {
         let mut recv_count: u64 = 0;
         let mut sniff_rx = sniff_rx;
         while let Some(payload) = sniff_rx.recv().await {
+            let target = *addr_reader.lock().await;
             recv_count += 1;
             if recv_count <= 5 {
-                info!("VIO: sniffed response #{} ({} bytes) -> UDP to QUIC at {}", recv_count, payload.len(), quic_addr);
+                info!("VIO: sniffed response #{} ({} bytes) -> UDP to QUIC at {}", recv_count, payload.len(), target);
             }
-            if let Err(e) = udp_send.send_to(&payload, &quic_addr).await {
+            if let Err(e) = udp_send.send_to(&payload, &target).await {
                 warn!("Failed to forward to QUIC client: {}", e);
                 break;
             }
@@ -140,6 +148,8 @@ async fn start_violation_bridge(
         loop {
             match udp_recv.recv_from(&mut buf).await {
                 Ok((n, from_addr)) if n > 0 => {
+                    // Update the QUIC client's address from the actual source
+                    *addr_writer.lock().await = from_addr;
                     pkt_count += 1;
                     if pkt_count <= 5 {
                         info!("VIO: UDP packet #{} from {} ({} bytes) -> raw TCP to {}", pkt_count, from_addr, n, vps_ip);
@@ -169,7 +179,7 @@ async fn start_violation_bridge(
 async fn run_quic_client(config: Arc<Config>) -> Result<()> {
     let client_config = build_client_config(&config)?;
 
-    let bind_addr: SocketAddr = format!("{}:{}", config.quic.local_ip, config.quic.client_port).parse()?;
+    let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.quic.client_port).parse()?;
     let mut endpoint = quinn::Endpoint::client(bind_addr)?;
     endpoint.set_default_client_config(client_config);
 
