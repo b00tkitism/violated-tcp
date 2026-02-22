@@ -1,3 +1,4 @@
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,10 +24,39 @@ fn default_xray_ip() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct Ports {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_port_mapping")]
     pub tcp_mapping: HashMap<u16, u16>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_port_mapping")]
     pub udp_mapping: HashMap<u16, u16>,
+}
+
+fn deserialize_port_mapping<'de, D>(deserializer: D) -> Result<HashMap<u16, u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct PortMapVisitor;
+
+    impl<'de> Visitor<'de> for PortMapVisitor {
+        type Value = HashMap<u16, u16>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a map of port numbers")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut result = HashMap::new();
+            while let Some((key, value)) = map.next_entry::<String, u16>()? {
+                let port: u16 = key.parse().map_err(de::Error::custom)?;
+                result.insert(port, value);
+            }
+            Ok(result)
+        }
+    }
+
+    deserializer.deserialize_map(PortMapVisitor)
 }
 
 #[derive(Debug, Deserialize)]
