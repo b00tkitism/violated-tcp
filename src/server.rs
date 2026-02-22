@@ -467,6 +467,7 @@ fn build_server_config(config: &Config) -> Result<quinn::ServerConfig> {
         quinn::IdleTimeout::try_from(std::time::Duration::from_secs(config.quic.idle_timeout_secs))?,
     ));
     transport.initial_mtu(config.quic.mtu);
+    transport.mtu_discovery_config(None);
 
     let max_data = quinn::VarInt::from_u64(config.quic.max_data)
         .unwrap_or(quinn::VarInt::from_u32(1_073_741_824));

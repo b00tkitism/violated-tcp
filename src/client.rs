@@ -520,6 +520,9 @@ fn build_client_config(config: &Config) -> Result<quinn::ClientConfig> {
         quinn::IdleTimeout::try_from(std::time::Duration::from_secs(config.quic.idle_timeout_secs))?,
     ));
     transport.initial_mtu(config.quic.mtu);
+    // Disable PMTUD - Quinn sees loopback MTU (65535) but the real path
+    // goes through the violation layer with ~1500 byte network MTU.
+    transport.mtu_discovery_config(None);
 
     let max_data = quinn::VarInt::from_u64(config.quic.max_data)
         .unwrap_or(quinn::VarInt::from_u32(1_073_741_824));
