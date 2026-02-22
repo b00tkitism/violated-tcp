@@ -101,7 +101,7 @@ async fn run_violation_bridge(
         );
 
         // Bind UDP socket for communication with QUIC server
-        let udp = UdpSocket::bind(format!("0.0.0.0:{}", config.violation.udp_server_port)).await?;
+        let udp = UdpSocket::bind(format!("{}:{}", config.quic.local_ip, config.violation.udp_server_port)).await?;
         udp.connect(&quic_addr).await?;
         let udp = Arc::new(udp);
 
@@ -173,7 +173,7 @@ async fn run_violation_bridge(
 /// QUIC tunnel server: accepts QUIC connections and proxies streams to backend services.
 async fn run_quic_server(config: Arc<Config>) -> Result<()> {
     let server_config = build_server_config(&config)?;
-    let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.quic.server_port).parse()?;
+    let bind_addr: SocketAddr = format!("{}:{}", config.quic.local_ip, config.quic.server_port).parse()?;
     let endpoint = quinn::Endpoint::server(server_config, bind_addr)?;
     warn!("QUIC server listening on {}", bind_addr);
 
