@@ -475,6 +475,13 @@ fn build_server_config(config: &Config) -> Result<quinn::ServerConfig> {
     transport.mtu_discovery_config(None);
     transport.initial_rtt(std::time::Duration::from_millis(config.quic.initial_rtt_ms));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    // NewReno with tuned loss reduction: on packet loss, only reduce window by 30%
+    // instead of Cubic's default 50%. This keeps throughput higher on lossy paths
+    // like the violation layer, where loss isn't necessarily congestion.
+    let mut cc = quinn::congestion::NewRenoConfig::default();
+    cc.initial_window(65536);
+    cc.loss_reduction_factor(0.7);
+    transport.congestion_controller_factory(Arc::new(cc));
 
     let max_data = quinn::VarInt::from_u64(config.quic.max_data)
         .unwrap_or(quinn::VarInt::from_u32(1_073_741_824));
