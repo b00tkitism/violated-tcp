@@ -1,5 +1,5 @@
 [package]
-name = "gfw-resist-proxy"
+name = "violated-tcp"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance TCP violation proxy for bypassing GFW IP blocking"

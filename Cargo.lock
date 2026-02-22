@@ -247,24 +247,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gfw-resist-proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "quinn",
- "rustls",
- "rustls-pemfile",
- "serde",
- "socket2 0.5.10",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1089,6 +1071,24 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "violated-tcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "quinn",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "socket2 0.5.10",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "walkdir"

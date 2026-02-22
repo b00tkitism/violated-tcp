@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "[*] Building project (release mode)..."
 cd "$SCRIPT_DIR"
 cargo build --release
-echo "[+] Build complete: target/release/gfw-resist-proxy"
+echo "[+] Build complete: target/release/violated-tcp"
 
 # Create config if not exists
 if [ ! -f config.toml ]; then
@@ -146,7 +146,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$SCRIPT_DIR/target/release/gfw-resist-proxy -c $SCRIPT_DIR/config.toml client
+ExecStart=$SCRIPT_DIR/target/release/violated-tcp -c $SCRIPT_DIR/config.toml client
 WorkingDirectory=$SCRIPT_DIR
 Restart=always
 RestartSec=3
@@ -171,7 +171,7 @@ echo "  Logs:    journalctl -u gfw-resist-client -f"
 echo "  Enable:  systemctl enable gfw-resist-client"
 echo ""
 echo "  Or run manually:"
-echo "  sudo ./target/release/gfw-resist-proxy -c config.toml client"
+echo "  sudo ./target/release/violated-tcp -c config.toml client"
 echo ""
 echo "  Local TCP ports forwarded to VPS:"
 for port in 14000 15000 16000; do

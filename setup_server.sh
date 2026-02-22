@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "[*] Building project (release mode)..."
 cd "$SCRIPT_DIR"
 cargo build --release
-echo "[+] Build complete: target/release/gfw-resist-proxy"
+echo "[+] Build complete: target/release/violated-tcp"
 
 # Generate TLS certificates
 if [ ! -f cert.pem ] || [ ! -f key.pem ]; then
@@ -113,7 +113,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$SCRIPT_DIR/target/release/gfw-resist-proxy -c $SCRIPT_DIR/config.toml server
+ExecStart=$SCRIPT_DIR/target/release/violated-tcp -c $SCRIPT_DIR/config.toml server
 WorkingDirectory=$SCRIPT_DIR
 Restart=always
 RestartSec=3
@@ -138,7 +138,7 @@ echo "  Logs:    journalctl -u gfw-resist-server -f"
 echo "  Enable:  systemctl enable gfw-resist-server"
 echo ""
 echo "  Or run manually:"
-echo "  ./target/release/gfw-resist-proxy -c config.toml server"
+echo "  ./target/release/violated-tcp -c config.toml server"
 echo ""
 echo "  [!] Remember to copy cert.pem to the client machine"
 echo ""

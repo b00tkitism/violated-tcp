@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "gfw-resist-proxy")]
+#[command(name = "violated-tcp")]
 #[command(about = "High-performance TCP violation proxy for bypassing GFW IP blocking")]
 struct Cli {
     #[command(subcommand)]
