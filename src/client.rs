@@ -110,8 +110,9 @@ async fn start_violation_bridge(
         config.violation.udp_client_port, vio_tcp_server_port
     );
 
-    // Bind UDP socket for communication with QUIC client
-    let udp = UdpSocket::bind(format!("0.0.0.0:{}", config.violation.udp_client_port)).await?;
+    // Bind UDP socket on loopback - Quinn connects to 127.0.0.1:udp_client_port,
+    // so responses must come FROM 127.0.0.1 to match the expected server address.
+    let udp = UdpSocket::bind(format!("{}:{}", config.quic.local_ip, config.violation.udp_client_port)).await?;
     let udp = Arc::new(udp);
 
     let udp_send = udp.clone();
