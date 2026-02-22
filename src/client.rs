@@ -3,8 +3,9 @@ use crate::packet;
 use anyhow::Result;
 use quinn::crypto::rustls::QuicClientConfig;
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,6 +15,20 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 const QUIC_CONNECT_TIMEOUT_SECS: u64 = 30;
+const BUF_SIZE: usize = 65536;
+
+fn pack_addr(addr: SocketAddr) -> u64 {
+    match addr {
+        SocketAddr::V4(v4) => ((u32::from(*v4.ip()) as u64) << 16) | (v4.port() as u64),
+        _ => 0,
+    }
+}
+
+fn unpack_addr(val: u64) -> SocketAddr {
+    let port = (val & 0xFFFF) as u16;
+    let ip = ((val >> 16) & 0xFFFFFFFF) as u32;
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port))
+}
 
 pub async fn run(config: Arc<Config>) -> Result<()> {
     loop {
@@ -67,6 +82,10 @@ fn start_sniffer(tx: mpsc::Sender<Vec<u8>>, vps_ip: Ipv4Addr, vio_server_port: u
                 return;
             }
         };
+        // BPF filter: only deliver packets from vps_ip:vio_server_port with AP flags
+        if let Err(e) = packet::attach_sniffer_filter(fd.as_fd(), vps_ip, vio_server_port, true) {
+            warn!("Failed to attach BPF filter: {} (falling back to userspace filter)", e);
+        }
         info!("Client sniffer started, watching for packets from {}", vps_ip);
         let mut buf = [0u8; 65535];
         loop {
@@ -118,19 +137,18 @@ async fn start_violation_bridge(
     let udp_send = udp.clone();
     let udp_recv = udp.clone();
 
-    // Track the QUIC client's actual source address dynamically.
-    // Quinn may send from different local IPs via PKTINFO, so we must
-    // send responses back to whatever address it actually used.
-    let quic_client_addr = Arc::new(tokio::sync::Mutex::new(quic_addr));
-    let addr_writer = quic_client_addr.clone();
+    // Track QUIC client's actual source address with lock-free atomic.
+    // Quinn overrides source IP via PKTINFO, so we send responses to whatever it used.
+    let quic_client_addr = Arc::new(AtomicU64::new(pack_addr(quic_addr)));
     let addr_reader = quic_client_addr.clone();
+    let addr_writer = quic_client_addr.clone();
 
     // Task 1: Sniffed violation responses -> QUIC client (via UDP)
     let vio_to_quic = tokio::spawn(async move {
         let mut recv_count: u64 = 0;
         let mut sniff_rx = sniff_rx;
         while let Some(payload) = sniff_rx.recv().await {
-            let target = *addr_reader.lock().await;
+            let target = unpack_addr(addr_reader.load(Ordering::Relaxed));
             recv_count += 1;
             if recv_count <= 5 {
                 info!("VIO: sniffed response #{} ({} bytes) -> UDP to QUIC at {}", recv_count, payload.len(), target);
@@ -149,8 +167,7 @@ async fn start_violation_bridge(
         loop {
             match udp_recv.recv_from(&mut buf).await {
                 Ok((n, from_addr)) if n > 0 => {
-                    // Update the QUIC client's address from the actual source
-                    *addr_writer.lock().await = from_addr;
+                    addr_writer.store(pack_addr(from_addr), Ordering::Relaxed);
                     pkt_count += 1;
                     if pkt_count <= 5 {
                         info!("VIO: UDP packet #{} from {} ({} bytes) -> raw TCP to {}", pkt_count, from_addr, n, vps_ip);
@@ -242,6 +259,7 @@ async fn run_tcp_forwarder(
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        stream.set_nodelay(true)?;
         info!("TCP connection from {} on port {}", addr, local_port);
         let conn = connection.clone();
         let auth = auth_code.clone();
@@ -301,9 +319,11 @@ async fn handle_tcp_client(
         tcp_write.write_all(&extra).await?;
     }
 
-    // Bidirectional forwarding
+    // Bidirectional forwarding with proper half-close.
+    // Using join! instead of select! so one direction finishing doesn't
+    // kill the other — critical for long-lived connections like SSH.
     let quic_to_tcp = async {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; BUF_SIZE];
         loop {
             match recv.read(&mut buf).await {
                 Ok(Some(n)) => {
@@ -314,10 +334,12 @@ async fn handle_tcp_client(
                 _ => break,
             }
         }
+        // Propagate end-of-stream: QUIC done → TCP FIN
+        let _ = tcp_write.shutdown().await;
     };
 
     let tcp_to_quic = async {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; BUF_SIZE];
         loop {
             match tcp_read.read(&mut buf).await {
                 Ok(0) => break,
@@ -329,14 +351,11 @@ async fn handle_tcp_client(
                 Err(_) => break,
             }
         }
+        // Propagate end-of-stream: TCP done → QUIC FIN
+        let _ = send.finish();
     };
 
-    tokio::select! {
-        _ = quic_to_tcp => {}
-        _ = tcp_to_quic => {}
-    }
-
-    let _ = send.finish();
+    tokio::join!(quic_to_tcp, tcp_to_quic);
     Ok(())
 }
 
@@ -523,6 +542,13 @@ fn build_client_config(config: &Config) -> Result<quinn::ClientConfig> {
     // Disable PMTUD - Quinn sees loopback MTU (65535) but the real path
     // goes through the violation layer with ~1500 byte network MTU.
     transport.mtu_discovery_config(None);
+    // Set realistic initial RTT estimate for congestion control.
+    // The QUIC path goes through the violation layer over a real network,
+    // not just loopback. Without this, Quinn's default 333ms is too high
+    // and congestion control ramps up too slowly.
+    transport.initial_rtt(std::time::Duration::from_millis(config.quic.initial_rtt_ms));
+    // Send keep-alive pings to detect dead connections and maintain NAT mappings.
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
 
     let max_data = quinn::VarInt::from_u64(config.quic.max_data)
         .unwrap_or(quinn::VarInt::from_u32(1_073_741_824));

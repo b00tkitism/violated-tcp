@@ -5,12 +5,25 @@ use quinn::crypto::rustls::QuicServerConfig;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::AsFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+const BUF_SIZE: usize = 65536;
+
+fn pack_addr(ip: Ipv4Addr, port: u16) -> u64 {
+    ((u32::from(ip) as u64) << 16) | (port as u64)
+}
+
+fn unpack_addr(val: u64) -> (Ipv4Addr, u16) {
+    let port = (val & 0xFFFF) as u16;
+    let ip = ((val >> 16) & 0xFFFFFFFF) as u32;
+    (Ipv4Addr::from(ip), port)
+}
 
 /// Data sniffed from a violation TCP packet (server side).
 struct SniffedData {
@@ -49,6 +62,10 @@ fn start_sniffer(tx: mpsc::Sender<SniffedData>, vps_ip: Ipv4Addr, vio_port: u16)
                 return;
             }
         };
+        // BPF filter: only deliver packets to vps_ip:vio_port with AP flags
+        if let Err(e) = packet::attach_sniffer_filter(fd.as_fd(), vps_ip, vio_port, false) {
+            warn!("Failed to attach BPF filter: {} (falling back to userspace filter)", e);
+        }
         info!("Server sniffer started on violation port {}", vio_port);
         let mut buf = [0u8; 65535];
         loop {
@@ -90,80 +107,69 @@ async fn run_violation_bridge(
     // Create raw sender socket
     let sender_fd = packet::create_sender_socket()?;
 
-    // Track the latest client address (same as Python's global client_ip/client_port)
-    let client_ip = Arc::new(tokio::sync::Mutex::new(Ipv4Addr::new(1, 1, 1, 1)));
-    let client_port = Arc::new(tokio::sync::Mutex::new(443u16));
+    // Lock-free client address tracking (same pattern as client.rs)
+    let client_addr = Arc::new(AtomicU64::new(pack_addr(Ipv4Addr::new(1, 1, 1, 1), 443)));
 
-    loop {
-        info!(
-            "VIO bridge: violated tcp:{} -> quic {}",
-            vio_tcp_server_port, quic_addr
-        );
+    info!(
+        "VIO bridge: violated tcp:{} -> quic {}",
+        vio_tcp_server_port, quic_addr
+    );
 
-        // Bind UDP socket for communication with QUIC server
-        let udp = UdpSocket::bind(format!("{}:{}", config.quic.local_ip, config.violation.udp_server_port)).await?;
-        udp.connect(&quic_addr).await?;
-        let udp = Arc::new(udp);
+    // Bind UDP socket for communication with QUIC server
+    let udp = UdpSocket::bind(format!("{}:{}", config.quic.local_ip, config.violation.udp_server_port)).await?;
+    udp.connect(&quic_addr).await?;
+    let udp = Arc::new(udp);
 
-        let udp_send = udp.clone();
-        let udp_recv = udp.clone();
-        let client_ip_w = client_ip.clone();
-        let client_port_w = client_port.clone();
-        let client_ip_r = client_ip.clone();
-        let client_port_r = client_port.clone();
+    let udp_send = udp.clone();
+    let udp_recv = udp.clone();
+    let addr_writer = client_addr.clone();
+    let addr_reader = client_addr.clone();
 
-        // Create a new sender FD reference for the response task
-        let sender_fd2 = packet::create_sender_socket()?;
+    // Create a new sender FD reference for the response task
+    let sender_fd2 = packet::create_sender_socket()?;
 
-        // Task 1: Forward sniffed violation packets -> QUIC (via UDP)
-        let vio_to_quic = tokio::spawn(async move {
-            while let Some(data) = sniff_rx.recv().await {
-                // Update latest client address
-                *client_ip_w.lock().await = data.client_ip;
-                *client_port_w.lock().await = data.client_port;
-                if let Err(e) = udp_send.send(&data.payload).await {
-                    warn!("Failed to send to QUIC: {}", e);
+    // Task 1: Forward sniffed violation packets -> QUIC (via UDP)
+    let vio_to_quic = tokio::spawn(async move {
+        while let Some(data) = sniff_rx.recv().await {
+            // Update latest client address (lock-free)
+            addr_writer.store(pack_addr(data.client_ip, data.client_port), Ordering::Relaxed);
+            if let Err(e) = udp_send.send(&data.payload).await {
+                warn!("Failed to send to QUIC: {}", e);
+                break;
+            }
+        }
+    });
+
+    // Task 2: Forward QUIC responses (via UDP) -> violation TCP
+    let vio_srv_port = vio_tcp_server_port;
+    let quic_to_vio = tokio::spawn(async move {
+        let mut buf = [0u8; 65535];
+        loop {
+            match udp_recv.recv(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    let (cip, cport) = unpack_addr(addr_reader.load(Ordering::Relaxed));
+                    let pkt = packet::build_violation_packet(
+                        vps_ip,
+                        cip,
+                        vio_srv_port,
+                        cport,
+                        &buf[..n],
+                    );
+                    packet::send_raw_packet(sender_fd2.as_fd(), &pkt, cip);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("UDP recv error: {}", e);
                     break;
                 }
             }
-        });
-
-        // Task 2: Forward QUIC responses (via UDP) -> violation TCP
-        let vio_srv_port = vio_tcp_server_port;
-        let quic_to_vio = tokio::spawn(async move {
-            let mut buf = [0u8; 65535];
-            loop {
-                match udp_recv.recv(&mut buf).await {
-                    Ok(n) if n > 0 => {
-                        let cip = *client_ip_r.lock().await;
-                        let cport = *client_port_r.lock().await;
-                        let pkt = packet::build_violation_packet(
-                            vps_ip,
-                            cip,
-                            vio_srv_port,
-                            cport,
-                            &buf[..n],
-                        );
-                        packet::send_raw_packet(sender_fd2.as_fd(), &pkt, cip);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("UDP recv error: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Wait for either task to finish (error recovery)
-        tokio::select! {
-            _ = vio_to_quic => { warn!("vio_to_quic task ended"); }
-            _ = quic_to_vio => { warn!("quic_to_vio task ended"); }
         }
+    });
 
-        // sniff_rx is consumed, we can't restart. In practice, this loop
-        // only runs once. For the sniffer to restart, the whole process restarts.
-        break;
+    // Wait for either task to finish
+    tokio::select! {
+        _ = vio_to_quic => { warn!("vio_to_quic task ended"); }
+        _ = quic_to_vio => { warn!("quic_to_vio task ended"); }
     }
 
     let _ = sender_fd;
@@ -315,6 +321,7 @@ async fn handle_tcp_proxy(
         config.general.xray_server_ip, target_port
     ))
     .await?;
+    backend.set_nodelay(true)?;
     info!("TCP connected to backend {}:{}", config.general.xray_server_ip, target_port);
 
     let (mut tcp_read, mut tcp_write) = backend.into_split();
@@ -323,9 +330,11 @@ async fn handle_tcp_proxy(
     let ready = format!("{}i am ready,!###!", config.quic.auth_code);
     send.write_all(ready.as_bytes()).await?;
 
-    // Bidirectional forwarding
+    // Bidirectional forwarding with proper half-close.
+    // Using join! instead of select! so one direction finishing doesn't
+    // kill the other — critical for long-lived connections like SSH.
     let quic_to_tcp = async {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; BUF_SIZE];
         loop {
             match recv.read(&mut buf).await {
                 Ok(Some(n)) => {
@@ -336,10 +345,11 @@ async fn handle_tcp_proxy(
                 _ => break,
             }
         }
+        let _ = tcp_write.shutdown().await;
     };
 
     let tcp_to_quic = async {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; BUF_SIZE];
         loop {
             match tcp_read.read(&mut buf).await {
                 Ok(0) => break,
@@ -351,14 +361,10 @@ async fn handle_tcp_proxy(
                 Err(_) => break,
             }
         }
+        let _ = send.finish();
     };
 
-    tokio::select! {
-        _ = quic_to_tcp => {}
-        _ = tcp_to_quic => {}
-    }
-
-    let _ = send.finish();
+    tokio::join!(quic_to_tcp, tcp_to_quic);
     info!("TCP proxy stream closed");
     Ok(())
 }
@@ -468,6 +474,8 @@ fn build_server_config(config: &Config) -> Result<quinn::ServerConfig> {
     ));
     transport.initial_mtu(config.quic.mtu);
     transport.mtu_discovery_config(None);
+    transport.initial_rtt(std::time::Duration::from_millis(config.quic.initial_rtt_ms));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
 
     let max_data = quinn::VarInt::from_u64(config.quic.max_data)
         .unwrap_or(quinn::VarInt::from_u32(1_073_741_824));

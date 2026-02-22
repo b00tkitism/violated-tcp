@@ -102,6 +102,8 @@ pub struct Quic {
     pub max_stream_data: u64,
     #[serde(default = "default_auth_code")]
     pub auth_code: String,
+    #[serde(default = "default_initial_rtt_ms")]
+    pub initial_rtt_ms: u64,
 }
 
 fn default_quic_server_port() -> u16 { 25000 }
@@ -115,6 +117,7 @@ fn default_key_path() -> String { "key.pem".to_string() }
 fn default_max_data() -> u64 { 1_073_741_824 }
 fn default_max_stream_data() -> u64 { 1_073_741_824 }
 fn default_auth_code() -> String { "jd!gn0s4".to_string() }
+fn default_initial_rtt_ms() -> u64 { 100 }
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {

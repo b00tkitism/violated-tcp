@@ -241,6 +241,72 @@ pub fn get_local_ip(target: Ipv4Addr) -> std::io::Result<Ipv4Addr> {
     }
 }
 
+/// Attach a BPF filter to the sniffer socket so the kernel only delivers
+/// matching violation packets instead of all IP traffic.
+/// `match_source`: true = match src IP/port (client), false = match dst (server).
+pub fn attach_sniffer_filter(
+    fd: std::os::fd::BorrowedFd<'_>,
+    ip: Ipv4Addr,
+    port: u16,
+    match_source: bool,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let ip_val = u32::from(ip);
+    let port_val = port as u32;
+    // SOCK_DGRAM strips ethernet header, data starts at IP header.
+    // Offsets assume IHL=5 (standard 20-byte IP header).
+    let ip_off: u32 = if match_source { 12 } else { 16 };
+    let port_off: u32 = if match_source { 20 } else { 22 };
+
+    #[repr(C)]
+    struct BpfInsn {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+    #[repr(C)]
+    struct BpfProg {
+        len: u16,
+        filter: *const BpfInsn,
+    }
+
+    let filter = [
+        BpfInsn { code: 0x30, jt: 0, jf: 0, k: 9 },          // ld  [9]  (protocol)
+        BpfInsn { code: 0x15, jt: 0, jf: 8, k: 6 },          // jeq TCP  -> next / reject
+        BpfInsn { code: 0x20, jt: 0, jf: 0, k: ip_off },     // ld  [ip_off]
+        BpfInsn { code: 0x15, jt: 0, jf: 6, k: ip_val },     // jeq ip   -> next / reject
+        BpfInsn { code: 0x28, jt: 0, jf: 0, k: port_off },   // ldh [port_off]
+        BpfInsn { code: 0x15, jt: 0, jf: 4, k: port_val },   // jeq port -> next / reject
+        BpfInsn { code: 0x30, jt: 0, jf: 0, k: 33 },         // ld  [33] (tcp flags)
+        BpfInsn { code: 0x54, jt: 0, jf: 0, k: 0x18 },       // and 0x18
+        BpfInsn { code: 0x15, jt: 0, jf: 1, k: 0x18 },       // jeq 0x18 -> accept / reject
+        BpfInsn { code: 0x06, jt: 0, jf: 0, k: 0xFFFF },     // ret accept
+        BpfInsn { code: 0x06, jt: 0, jf: 0, k: 0 },          // ret reject
+    ];
+
+    let prog = BpfProg {
+        len: filter.len() as u16,
+        filter: filter.as_ptr(),
+    };
+
+    const SO_ATTACH_FILTER: libc::c_int = 26;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_ATTACH_FILTER,
+            &prog as *const BpfProg as *const libc::c_void,
+            std::mem::size_of::<BpfProg>() as u32,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Receive a raw IP packet from the sniffer socket.
 /// Returns the number of bytes read, or 0 on error.
 pub fn recv_raw_packet(fd: std::os::fd::BorrowedFd<'_>, buf: &mut [u8]) -> usize {
