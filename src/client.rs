@@ -10,7 +10,10 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+
+const QUIC_CONNECT_TIMEOUT_SECS: u64 = 30;
 
 pub async fn run(config: Arc<Config>) -> Result<()> {
     loop {
@@ -40,13 +43,18 @@ async fn run_inner(config: Arc<Config>) -> Result<()> {
     // Start packet sniffer in dedicated thread
     start_sniffer(sniff_tx, vps_ip, config.violation.tcp_server_port);
 
-    // Start violation bridge and QUIC client concurrently
-    tokio::try_join!(
-        run_violation_bridge(config.clone(), sniff_rx, vps_ip, local_ip),
-        run_quic_client(config.clone()),
-    )?;
+    // Start violation bridge tasks (returns handles for cleanup)
+    let (vio_handle1, vio_handle2) =
+        start_violation_bridge(config.clone(), sniff_rx, vps_ip, local_ip).await?;
 
-    Ok(())
+    // Run QUIC client (blocks until connection fails or forwarders stop)
+    let result = run_quic_client(config.clone()).await;
+
+    // Abort bridge tasks so ports are released for restart
+    vio_handle1.abort();
+    vio_handle2.abort();
+
+    result
 }
 
 /// Sniffer thread: captures TCP packets from VPS with AP flags.
@@ -82,13 +90,13 @@ fn start_sniffer(tx: mpsc::Sender<Vec<u8>>, vps_ip: Ipv4Addr, vio_server_port: u
     });
 }
 
-/// Violation bridge: raw TCP <-> UDP loopback to QUIC client.
-async fn run_violation_bridge(
+/// Start violation bridge tasks. Returns JoinHandles so caller can abort on cleanup.
+async fn start_violation_bridge(
     config: Arc<Config>,
-    mut sniff_rx: mpsc::Receiver<Vec<u8>>,
+    sniff_rx: mpsc::Receiver<Vec<u8>>,
     vps_ip: Ipv4Addr,
     local_ip: Ipv4Addr,
-) -> Result<()> {
+) -> Result<(JoinHandle<()>, JoinHandle<()>)> {
     let quic_addr: SocketAddr =
         format!("{}:{}", config.quic.local_ip, config.quic.client_port).parse()?;
     let vio_tcp_client_port = config.violation.tcp_client_port;
@@ -112,6 +120,7 @@ async fn run_violation_bridge(
     // Task 1: Sniffed violation responses -> QUIC client (via UDP)
     let vio_to_quic = tokio::spawn(async move {
         let mut recv_count: u64 = 0;
+        let mut sniff_rx = sniff_rx;
         while let Some(payload) = sniff_rx.recv().await {
             recv_count += 1;
             if recv_count <= 5 {
@@ -153,12 +162,7 @@ async fn run_violation_bridge(
         }
     });
 
-    tokio::select! {
-        _ = vio_to_quic => { warn!("vio_to_quic ended"); }
-        _ = quic_to_vio => { warn!("quic_to_vio ended"); }
-    }
-
-    Ok(())
+    Ok((vio_to_quic, quic_to_vio))
 }
 
 /// QUIC tunnel client: connects through the violation layer and provides port forwarding.
@@ -173,7 +177,13 @@ async fn run_quic_client(config: Arc<Config>) -> Result<()> {
         format!("{}:{}", config.quic.local_ip, config.violation.udp_client_port).parse()?;
 
     warn!("Connecting to QUIC server via violation layer...");
-    let connection = endpoint.connect(server_addr, "proxy")?.await?;
+    let connecting = endpoint.connect(server_addr, "proxy")?;
+    let connection = tokio::time::timeout(
+        std::time::Duration::from_secs(QUIC_CONNECT_TIMEOUT_SECS),
+        connecting,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("QUIC connection timed out after {}s", QUIC_CONNECT_TIMEOUT_SECS))??;
     warn!("QUIC connection established!");
 
     let connection = Arc::new(connection);
