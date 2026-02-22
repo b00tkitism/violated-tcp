@@ -542,12 +542,7 @@ fn build_client_config(config: &Config) -> Result<quinn::ClientConfig> {
     // Disable PMTUD - Quinn sees loopback MTU (65535) but the real path
     // goes through the violation layer with ~1500 byte network MTU.
     transport.mtu_discovery_config(None);
-    // Set realistic initial RTT estimate for congestion control.
-    // The QUIC path goes through the violation layer over a real network,
-    // not just loopback. Without this, Quinn's default 333ms is too high
-    // and congestion control ramps up too slowly.
     transport.initial_rtt(std::time::Duration::from_millis(config.quic.initial_rtt_ms));
-    // Send keep-alive pings to detect dead connections and maintain NAT mappings.
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
 
     let max_data = quinn::VarInt::from_u64(config.quic.max_data)
