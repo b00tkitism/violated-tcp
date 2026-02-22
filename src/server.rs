@@ -81,11 +81,10 @@ fn start_sniffer(tx: mpsc::Sender<SniffedData>, vps_ip: Ipv4Addr, vio_port: u16)
                     && !parsed.payload.is_empty()
                 {
                     let data = SniffedData {
-                        payload: parsed.payload.clone(),
+                        payload: parsed.payload,
                         client_ip: parsed.src_ip,
                         client_port: parsed.src_port,
                     };
-                    tracing::debug!("SNIFF: {} bytes from {}:{}", parsed.payload.len(), parsed.src_ip, parsed.src_port);
                     if tx.blocking_send(data).is_err() {
                         break; // Channel closed
                     }

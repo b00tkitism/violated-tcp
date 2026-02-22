@@ -199,6 +199,17 @@ pub fn create_sniffer_socket() -> std::io::Result<std::os::fd::OwnedFd> {
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // Increase receive buffer to reduce kernel drops during packet bursts
+    let buf_size: libc::c_int = 4 * 1024 * 1024; // 4MB
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as u32,
+        );
+    }
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 

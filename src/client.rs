@@ -145,14 +145,9 @@ async fn start_violation_bridge(
 
     // Task 1: Sniffed violation responses -> QUIC client (via UDP)
     let vio_to_quic = tokio::spawn(async move {
-        let mut recv_count: u64 = 0;
         let mut sniff_rx = sniff_rx;
         while let Some(payload) = sniff_rx.recv().await {
             let target = unpack_addr(addr_reader.load(Ordering::Relaxed));
-            recv_count += 1;
-            if recv_count <= 5 {
-                info!("VIO: sniffed response #{} ({} bytes) -> UDP to QUIC at {}", recv_count, payload.len(), target);
-            }
             if let Err(e) = udp_send.send_to(&payload, &target).await {
                 warn!("Failed to forward to QUIC client: {}", e);
                 break;
@@ -163,15 +158,10 @@ async fn start_violation_bridge(
     // Task 2: QUIC client packets (via UDP) -> violation raw TCP
     let quic_to_vio = tokio::spawn(async move {
         let mut buf = [0u8; 65535];
-        let mut pkt_count: u64 = 0;
         loop {
             match udp_recv.recv_from(&mut buf).await {
                 Ok((n, from_addr)) if n > 0 => {
                     addr_writer.store(pack_addr(from_addr), Ordering::Relaxed);
-                    pkt_count += 1;
-                    if pkt_count <= 5 {
-                        info!("VIO: UDP packet #{} from {} ({} bytes) -> raw TCP to {}", pkt_count, from_addr, n, vps_ip);
-                    }
                     let pkt = packet::build_violation_packet(
                         local_ip,
                         vps_ip,
