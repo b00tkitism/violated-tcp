@@ -1,4 +1,5 @@
 use std::net::Ipv4Addr;
+use tracing::warn;
 
 // TCP flags
 const TCP_ACK: u8 = 0x10;
@@ -43,7 +44,7 @@ pub fn build_violation_packet(
     // pkt[1] = 0x00; // DSCP/ECN
     pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
     // pkt[4..6] = identification (kernel fills if 0)
-    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // Don't Fragment
+    // pkt[6..8] = flags + fragment offset = 0 (no DF, matching scapy default)
     pkt[8] = 64; // TTL
     pkt[9] = 6;  // Protocol: TCP
     // pkt[10..12] = checksum (kernel computes when 0)
@@ -201,8 +202,8 @@ pub fn create_sniffer_socket() -> std::io::Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
-/// Send a raw IP packet via the sender socket.
-pub fn send_raw_packet(fd: std::os::fd::BorrowedFd<'_>, packet: &[u8], dst_ip: Ipv4Addr) {
+/// Send a raw IP packet via the sender socket. Returns bytes sent or -1 on error.
+pub fn send_raw_packet(fd: std::os::fd::BorrowedFd<'_>, packet: &[u8], dst_ip: Ipv4Addr) -> isize {
     use std::os::fd::AsRawFd;
     let dst_addr = libc::sockaddr_in {
         sin_family: libc::AF_INET as u16,
@@ -212,7 +213,7 @@ pub fn send_raw_packet(fd: std::os::fd::BorrowedFd<'_>, packet: &[u8], dst_ip: I
         },
         sin_zero: [0; 8],
     };
-    unsafe {
+    let ret = unsafe {
         libc::sendto(
             fd.as_raw_fd(),
             packet.as_ptr() as *const _,
@@ -220,7 +221,23 @@ pub fn send_raw_packet(fd: std::os::fd::BorrowedFd<'_>, packet: &[u8], dst_ip: I
             0,
             &dst_addr as *const libc::sockaddr_in as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_in>() as u32,
-        );
+        )
+    };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        warn!("sendto failed: {} (packet_len={}, dst={})", err, packet.len(), dst_ip);
+    }
+    ret
+}
+
+/// Determine the local IP address used to reach a given target IP.
+/// Uses a connected UDP socket trick (no actual packets sent).
+pub fn get_local_ip(target: Ipv4Addr) -> std::io::Result<Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect(std::net::SocketAddr::new(target.into(), 80))?;
+    match socket.local_addr()?.ip() {
+        std::net::IpAddr::V4(ip) => Ok(ip),
+        _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "not IPv4")),
     }
 }
 

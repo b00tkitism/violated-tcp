@@ -30,6 +30,10 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
 async fn run_inner(config: Arc<Config>) -> Result<()> {
     let vps_ip: Ipv4Addr = config.general.vps_ip.parse()?;
 
+    // Resolve local IP used to reach VPS (needed for correct TCP checksum)
+    let local_ip = packet::get_local_ip(vps_ip)?;
+    warn!("Local IP for violation packets: {}", local_ip);
+
     // Channel: sniffer -> async world
     let (sniff_tx, sniff_rx) = mpsc::channel::<Vec<u8>>(4096);
 
@@ -38,7 +42,7 @@ async fn run_inner(config: Arc<Config>) -> Result<()> {
 
     // Start violation bridge and QUIC client concurrently
     tokio::try_join!(
-        run_violation_bridge(config.clone(), sniff_rx, vps_ip),
+        run_violation_bridge(config.clone(), sniff_rx, vps_ip, local_ip),
         run_quic_client(config.clone()),
     )?;
 
@@ -83,6 +87,7 @@ async fn run_violation_bridge(
     config: Arc<Config>,
     mut sniff_rx: mpsc::Receiver<Vec<u8>>,
     vps_ip: Ipv4Addr,
+    local_ip: Ipv4Addr,
 ) -> Result<()> {
     let quic_addr: SocketAddr =
         format!("{}:{}", config.quic.local_ip, config.quic.client_port).parse()?;
@@ -106,7 +111,12 @@ async fn run_violation_bridge(
 
     // Task 1: Sniffed violation responses -> QUIC client (via UDP)
     let vio_to_quic = tokio::spawn(async move {
+        let mut recv_count: u64 = 0;
         while let Some(payload) = sniff_rx.recv().await {
+            recv_count += 1;
+            if recv_count <= 5 {
+                info!("VIO: sniffed response #{} ({} bytes) -> UDP to QUIC at {}", recv_count, payload.len(), quic_addr);
+            }
             if let Err(e) = udp_send.send_to(&payload, &quic_addr).await {
                 warn!("Failed to forward to QUIC client: {}", e);
                 break;
@@ -117,11 +127,16 @@ async fn run_violation_bridge(
     // Task 2: QUIC client packets (via UDP) -> violation raw TCP
     let quic_to_vio = tokio::spawn(async move {
         let mut buf = [0u8; 65535];
+        let mut pkt_count: u64 = 0;
         loop {
-            match udp_recv.recv(&mut buf).await {
-                Ok(n) if n > 0 => {
+            match udp_recv.recv_from(&mut buf).await {
+                Ok((n, from_addr)) if n > 0 => {
+                    pkt_count += 1;
+                    if pkt_count <= 5 {
+                        info!("VIO: UDP packet #{} from {} ({} bytes) -> raw TCP to {}", pkt_count, from_addr, n, vps_ip);
+                    }
                     let pkt = packet::build_violation_packet(
-                        Ipv4Addr::UNSPECIFIED, // kernel fills source IP
+                        local_ip,
                         vps_ip,
                         vio_tcp_client_port,
                         vio_tcp_server_port,
